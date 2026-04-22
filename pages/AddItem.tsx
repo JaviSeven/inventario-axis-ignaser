@@ -2,38 +2,14 @@
 import React, { useState, useRef } from 'react';
 import { Camera, Save, X, MapPin, Package, MapPinned, Lock } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import * as XLSX from 'xlsx';
 import { User } from '../types';
 
 interface AddItemProps {
   onAdd: (item: { concept: string; obra: string; description: string; imageUrl: string; quantity: number; location: string }) => void | Promise<void>;
-  onBulkAdd: (items: Array<{ concept: string; obra: string; description: string; quantity: number; location: string }>) => Promise<{ created: number; skipped: number }>;
   currentUser: User;
 }
 
-const normalizeHeader = (value: string) =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-const pickValue = (row: Record<string, unknown>, aliases: string[]) => {
-  const normalized = Object.entries(row).reduce<Record<string, unknown>>((acc, [key, value]) => {
-    acc[normalizeHeader(String(key))] = value;
-    return acc;
-  }, {});
-  for (const alias of aliases) {
-    const value = normalized[normalizeHeader(alias)];
-    if (value !== undefined && value !== null && String(value).trim() !== '') {
-      return value;
-    }
-  }
-  return '';
-};
-
-const AddItem: React.FC<AddItemProps> = ({ onAdd, onBulkAdd, currentUser }) => {
+const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
   const navigate = useNavigate();
 
   if (currentUser.role === 'SoloLectura') {
@@ -61,11 +37,7 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, onBulkAdd, currentUser }) => {
   const [imageUrl, setImageUrl] = useState('');
   const [quantity, setQuantity] = useState<number>(1);
   const [location, setLocation] = useState('');
-  const [bulkMessage, setBulkMessage] = useState<string | null>(null);
-  const [bulkError, setBulkError] = useState<string | null>(null);
-  const [bulkLoading, setBulkLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const excelInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -92,76 +64,6 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, onBulkAdd, currentUser }) => {
     });
 
     navigate('/inventory');
-  };
-
-  const downloadTemplate = () => {
-    const template = XLSX.utils.aoa_to_sheet([
-      ['Concepto', 'Obra', 'Descripción', 'Unidades', 'Ubicación'],
-      ['Cable UTP Cat6', 'Obra Norte', 'Caja abierta, material revisado', 12, 'Estantería A1'],
-      ['Tubo PVC 20mm', 'Obra Centro', 'Tramo de 3 metros', 30, 'Pasillo 2 - Balda 4']
-    ]);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, template, 'Plantilla');
-    XLSX.writeFile(workbook, 'plantilla_carga_masiva_inventario.xlsx');
-  };
-
-  const handleExcelImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    setBulkMessage(null);
-    setBulkError(null);
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setBulkLoading(true);
-    try {
-      const buffer = await file.arrayBuffer();
-      const workbook = XLSX.read(buffer, { type: 'array' });
-      const firstSheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[firstSheetName];
-      if (!sheet) {
-        setBulkError('El archivo no tiene hojas válidas.');
-        return;
-      }
-
-      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
-      const parsed: Array<{ concept: string; obra: string; description: string; quantity: number; location: string }> = [];
-      let invalidRows = 0;
-
-      for (const row of rows) {
-        const concept = String(pickValue(row, ['Concepto', 'Concepto / Nombre', 'Nombre', 'Material'])).trim();
-        const obra = String(pickValue(row, ['Obra', 'Obra de procedencia'])).trim();
-        const description = String(pickValue(row, ['Descripción', 'Descripcion', 'Descripción / Observaciones', 'Observaciones'])).trim();
-        const location = String(pickValue(row, ['Ubicación', 'Ubicacion', 'Ubicación en el almacén', 'Ubicacion en el almacen'])).trim();
-        const rawQuantity = pickValue(row, ['Unidades', 'Cantidad', 'Qty', 'Quantity']);
-        const quantity = Math.floor(Number(String(rawQuantity).replace(',', '.')));
-
-        const isEmptyRow = !concept && !obra && !description && !location && !String(rawQuantity).trim();
-        if (isEmptyRow) continue;
-
-        if (!concept || !obra || !description || !location || !Number.isFinite(quantity) || quantity < 1) {
-          invalidRows += 1;
-          continue;
-        }
-
-        parsed.push({ concept, obra, description, quantity, location });
-      }
-
-      if (parsed.length === 0) {
-        setBulkError('No se encontraron filas válidas para importar. Revisa la plantilla.');
-        return;
-      }
-
-      const result = await onBulkAdd(parsed);
-      const totalSkipped = result.skipped + invalidRows;
-      setBulkMessage(`Carga masiva completada: ${result.created} materiales creados${totalSkipped > 0 ? `, ${totalSkipped} omitidos` : ''}.`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error desconocido';
-      setBulkError(`No se pudo procesar el Excel: ${message}`);
-    } finally {
-      setBulkLoading(false);
-      if (excelInputRef.current) {
-        excelInputRef.current.value = '';
-      }
-    }
   };
 
   return (
@@ -290,39 +192,6 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, onBulkAdd, currentUser }) => {
               >
                 <Save size={20} /> Dar entrada
               </button>
-            </div>
-
-            <div className="border-t border-slate-200 pt-6 mt-2">
-              <h3 className="text-lg font-bold text-slate-800 mb-2">Carga masiva por Excel</h3>
-              <p className="text-sm text-slate-500 mb-4">
-                Descarga la plantilla, rellénala y súbela para crear varios materiales en un solo paso.
-              </p>
-              <div className="flex flex-col md:flex-row gap-3">
-                <button
-                  type="button"
-                  onClick={downloadTemplate}
-                  className="px-4 py-3 bg-emerald-50 text-emerald-700 rounded-xl font-semibold hover:bg-emerald-100 transition-colors border border-emerald-100"
-                >
-                  Descargar plantilla Excel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => excelInputRef.current?.click()}
-                  disabled={bulkLoading}
-                  className="px-4 py-3 bg-blue-50 text-blue-700 rounded-xl font-semibold hover:bg-blue-100 transition-colors border border-blue-100 disabled:opacity-60"
-                >
-                  {bulkLoading ? 'Importando...' : 'Subir archivo Excel'}
-                </button>
-                <input
-                  ref={excelInputRef}
-                  type="file"
-                  accept=".xlsx,.xls"
-                  className="hidden"
-                  onChange={handleExcelImport}
-                />
-              </div>
-              {bulkMessage && <p className="mt-3 text-sm text-emerald-700 font-medium">{bulkMessage}</p>}
-              {bulkError && <p className="mt-3 text-sm text-rose-600 font-medium">{bulkError}</p>}
             </div>
           </form>
         </div>

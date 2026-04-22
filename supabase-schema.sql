@@ -1,10 +1,4 @@
--- Inventario Ignaser: ejecutar en Supabase → SQL → New query
--- 1) Copia y ejecuta todo el script.
--- 2) Authentication → activa "Email" (y desactiva "Confirm email" en desarrollo si quieres probar al instante).
--- 3) Crea usuarios: Authentication → Users → Add user, o vía "Sign up" en la app.
--- 4) Metadatos del usuario: en el usuario → User Metadata (JSON), ejemplo:
---    { "name": "María", "role": "Admin" }
---    role permitidos: "Admin" | "Operario" | "SoloLectura"
+-- Esquema para Almacén Pro - Ejecutar en Supabase SQL Editor
 
 -- Tabla de artículos (inventario)
 create table if not exists public.items (
@@ -20,6 +14,7 @@ create table if not exists public.items (
 );
 
 -- Tabla de movimientos (historial)
+-- item_id nullable y ON DELETE SET NULL para conservar movimientos cuando se elimina un ítem (stock 0)
 create table if not exists public.movements (
   id uuid primary key default gen_random_uuid(),
   item_id uuid references public.items(id) on delete set null,
@@ -38,25 +33,14 @@ create table if not exists public.movements (
 create index if not exists idx_movements_item_id on public.movements(item_id);
 create index if not exists idx_movements_timestamp on public.movements(timestamp desc);
 
--- Row Level Security: solo usuarios con sesión (JWT) pueden leer/escribir
+-- Row Level Security (RLS)
 alter table public.items enable row level security;
 alter table public.movements enable row level security;
 
-drop policy if exists "Allow all on items" on public.items;
-drop policy if exists "Allow all on movements" on public.movements;
-drop policy if exists "items authenticated all" on public.items;
-drop policy if exists "movements authenticated all" on public.movements;
+create policy "Allow all on items"
+  on public.items for all
+  using (true) with check (true);
 
-create policy "items authenticated all"
-  on public.items
-  for all
-  to authenticated
-  using (true)
-  with check (true);
-
-create policy "movements authenticated all"
-  on public.movements
-  for all
-  to authenticated
-  using (true)
-  with check (true);
+create policy "Allow all on movements"
+  on public.movements for all
+  using (true) with check (true);

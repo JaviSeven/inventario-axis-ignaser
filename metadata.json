@@ -1,5 +1,5 @@
 {
-  "name": "Gestión de Almacén Pro",
+  "name": "Inventario Ignaser",
   "description": "Una aplicación avanzada para el control de inventario con seguimiento de movimientos por usuario, historial detallado y exportación de datos.",
   "requestFramePermissions": [
     "camera"

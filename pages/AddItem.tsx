@@ -1,18 +1,45 @@
 
-import React, { useState, useRef } from 'react';
-import { Camera, Save, X, MapPin, Package, MapPinned, Lock } from 'lucide-react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
+import { Camera, Save, X, MapPin, Package, MapPinned, Lock, Search, RefreshCw, PlusCircle, ChevronDown, Check } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { User } from '../types';
+import * as XLSX from 'xlsx';
+import { User, StockItem, canEditUnits } from '../types';
 
 interface AddItemProps {
-  onAdd: (item: { concept: string; obra: string; description: string; imageUrl: string; quantity: number; location: string }) => void | Promise<void>;
+  items: StockItem[];
+  onRestock: (itemId: string, amount: number, obraProcedencia: string, note: string) => Promise<boolean>;
+  onAdd: (item: { concept: string; obra: string; description: string; imageUrl: string; quantity: number; location: string; isRecurrent: boolean; minStock?: number }) => void | Promise<void>;
+  onBulkAdd: (items: Array<{ concept: string; obra: string; description: string; quantity: number; location: string }>) => Promise<{ created: number; skipped: number }>;
   currentUser: User;
 }
 
-const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
-  const navigate = useNavigate();
+const normalizeHeader = (value: string) =>
+  value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  if (currentUser.role === 'SoloLectura') {
+const pickValue = (row: Record<string, unknown>, aliases: string[]) => {
+  const normalized = Object.entries(row).reduce<Record<string, unknown>>((acc, [key, value]) => {
+    acc[normalizeHeader(String(key))] = value;
+    return acc;
+  }, {});
+  for (const alias of aliases) {
+    const value = normalized[normalizeHeader(alias)];
+    if (value !== undefined && value !== null && String(value).trim() !== '') {
+      return value;
+    }
+  }
+  return '';
+};
+
+const AddItem: React.FC<AddItemProps> = ({ items, onAdd, onBulkAdd, onRestock, currentUser }) => {
+  const navigate = useNavigate();
+  const [mode, setMode] = useState<'existing' | 'new' | null>(null);
+
+  if (!canEditUnits(currentUser)) {
     return (
       <div className="max-w-2xl mx-auto animate-in fade-in duration-500 pb-12">
         <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm p-12 text-center">
@@ -37,7 +64,13 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
   const [imageUrl, setImageUrl] = useState('');
   const [quantity, setQuantity] = useState<number>(1);
   const [location, setLocation] = useState('');
+  const [isRecurrent, setIsRecurrent] = useState<'no' | 'si'>('no');
+  const [minStock, setMinStock] = useState<string>('1');
+  const [bulkMessage, setBulkMessage] = useState<string | null>(null);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [bulkLoading, setBulkLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const excelInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -52,7 +85,10 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const parsedMinStock = Math.floor(Number(minStock));
+    const recurrent = isRecurrent === 'si';
     if (!concept || !obra || !description || quantity < 1 || !location.trim()) return;
+    if (recurrent && (!Number.isFinite(parsedMinStock) || parsedMinStock < 1)) return;
 
     await onAdd({
       concept,
@@ -60,17 +96,96 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
       description,
       imageUrl: imageUrl || '',
       quantity,
-      location: location.trim()
+      location: location.trim(),
+      isRecurrent: recurrent,
+      minStock: recurrent ? parsedMinStock : undefined
     });
 
     navigate('/inventory');
   };
 
+  const downloadTemplate = () => {
+    const template = XLSX.utils.aoa_to_sheet([
+      ['Concepto', 'Obra', 'Descripción', 'Unidades', 'Ubicación'],
+      ['Cable UTP Cat6', 'Obra Norte', 'Caja abierta, material revisado', 12, 'Estantería A1'],
+      ['Tubo PVC 20mm', 'Obra Centro', 'Tramo de 3 metros', 30, 'Pasillo 2 - Balda 4']
+    ]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, template, 'Plantilla');
+    XLSX.writeFile(workbook, 'plantilla_carga_masiva_inventario.xlsx');
+  };
+
+  const handleExcelImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setBulkMessage(null);
+    setBulkError(null);
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setBulkLoading(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[firstSheetName];
+      if (!sheet) {
+        setBulkError('El archivo no tiene hojas válidas.');
+        return;
+      }
+
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+      const parsed: Array<{ concept: string; obra: string; description: string; quantity: number; location: string }> = [];
+      let invalidRows = 0;
+
+      for (const row of rows) {
+        const concept = String(pickValue(row, ['Concepto', 'Concepto / Nombre', 'Nombre', 'Material'])).trim();
+        const obra = String(pickValue(row, ['Obra', 'Obra de procedencia'])).trim();
+        const description = String(pickValue(row, ['Descripción', 'Descripcion', 'Descripción / Observaciones', 'Observaciones'])).trim();
+        const location = String(pickValue(row, ['Ubicación', 'Ubicacion', 'Ubicación en el almacén', 'Ubicacion en el almacen'])).trim();
+        const rawQuantity = pickValue(row, ['Unidades', 'Cantidad', 'Qty', 'Quantity']);
+        const quantity = Math.floor(Number(String(rawQuantity).replace(',', '.')));
+
+        const isEmptyRow = !concept && !obra && !description && !location && !String(rawQuantity).trim();
+        if (isEmptyRow) continue;
+
+        if (!concept || !obra || !description || !location || !Number.isFinite(quantity) || quantity < 1) {
+          invalidRows += 1;
+          continue;
+        }
+
+        parsed.push({ concept, obra, description, quantity, location });
+      }
+
+      if (parsed.length === 0) {
+        setBulkError('No se encontraron filas válidas para importar. Revisa la plantilla.');
+        return;
+      }
+
+      const result = await onBulkAdd(parsed);
+      const totalSkipped = result.skipped + invalidRows;
+      setBulkMessage(`Carga masiva completada: ${result.created} materiales creados${totalSkipped > 0 ? `, ${totalSkipped} omitidos` : ''}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Error desconocido';
+      setBulkError(`No se pudo procesar el Excel: ${message}`);
+    } finally {
+      setBulkLoading(false);
+      if (excelInputRef.current) {
+        excelInputRef.current.value = '';
+      }
+    }
+  };
+
   return (
-    <div className="max-w-2xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 pb-12">
+    <div className="max-w-2xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 pb-12 space-y-6">
+      <ModeSelector mode={mode} onChange={setMode} />
+
+      {mode === 'existing' && (
+        <RestockForm items={items} onRestock={onRestock} onDone={() => navigate('/inventory')} onCancel={() => setMode(null)} />
+      )}
+
+      {mode === 'new' && (
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
         <div className="p-8">
-          <h2 className="text-2xl font-bold text-slate-800 mb-2">Dar entrada a material</h2>
+          <h2 className="text-2xl font-bold text-slate-800 mb-2">Entrada nuevo material</h2>
           <p className="text-slate-500 mb-8 text-sm">Completa los datos del material e indica las unidades y la ubicación en el almacén.</p>
           
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -144,6 +259,34 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
               </div>
             </div>
 
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-slate-700">Material recurrente</label>
+                <select
+                  value={isRecurrent}
+                  onChange={(e) => setIsRecurrent(e.target.value as 'no' | 'si')}
+                  className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                >
+                  <option value="no">No</option>
+                  <option value="si">Si</option>
+                </select>
+              </div>
+              {isRecurrent === 'si' && (
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-slate-700">Cantidad minima en stock</label>
+                  <input
+                    required
+                    type="number"
+                    min={1}
+                    value={minStock}
+                    onChange={(e) => setMinStock(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                    placeholder="Ej. 10"
+                  />
+                </div>
+              )}
+            </div>
+
             <div className="space-y-4">
               <label className="text-sm font-semibold text-slate-700">Fotografía del Material</label>
               
@@ -193,8 +336,310 @@ const AddItem: React.FC<AddItemProps> = ({ onAdd, currentUser }) => {
                 <Save size={20} /> Dar entrada
               </button>
             </div>
+
+            <div className="border-t border-slate-200 pt-6 mt-2">
+              <h3 className="text-lg font-bold text-slate-800 mb-2">Carga masiva por Excel</h3>
+              <p className="text-sm text-slate-500 mb-4">
+                Descarga la plantilla, rellénala y súbela para crear varios materiales en un solo paso.
+              </p>
+              <div className="flex flex-col md:flex-row gap-3">
+                <button
+                  type="button"
+                  onClick={downloadTemplate}
+                  className="px-4 py-3 bg-emerald-50 text-emerald-700 rounded-xl font-semibold hover:bg-emerald-100 transition-colors border border-emerald-100"
+                >
+                  Descargar plantilla Excel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => excelInputRef.current?.click()}
+                  disabled={bulkLoading}
+                  className="px-4 py-3 bg-blue-50 text-blue-700 rounded-xl font-semibold hover:bg-blue-100 transition-colors border border-blue-100 disabled:opacity-60"
+                >
+                  {bulkLoading ? 'Importando...' : 'Subir archivo Excel'}
+                </button>
+                <input
+                  ref={excelInputRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  className="hidden"
+                  onChange={handleExcelImport}
+                />
+              </div>
+              {bulkMessage && <p className="mt-3 text-sm text-emerald-700 font-medium">{bulkMessage}</p>}
+              {bulkError && <p className="mt-3 text-sm text-rose-600 font-medium">{bulkError}</p>}
+            </div>
           </form>
         </div>
+      </div>
+      )}
+    </div>
+  );
+};
+
+const ModeSelector: React.FC<{ mode: 'existing' | 'new' | null; onChange: (m: 'existing' | 'new') => void }> = ({ mode, onChange }) => {
+  const base = 'flex-1 text-left p-5 rounded-2xl border-2 transition-all flex items-start gap-4';
+  return (
+    <div>
+      {mode === null && (
+        <p className="text-slate-500 text-sm mb-3">¿Qué quieres hacer?</p>
+      )}
+      <div className="flex flex-col md:flex-row gap-4">
+        <button
+          type="button"
+          onClick={() => onChange('existing')}
+          className={`${base} ${mode === 'existing' ? 'border-blue-600 bg-blue-50' : 'border-slate-200 bg-white hover:border-blue-300'}`}
+        >
+          <div className={`p-2.5 rounded-xl ${mode === 'existing' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}>
+            <RefreshCw size={22} />
+          </div>
+          <div>
+            <p className="font-bold text-slate-800">Actualizar material existente</p>
+            <p className="text-xs text-slate-500 mt-1">Suma unidades a un material que ya está en el inventario.</p>
+          </div>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange('new')}
+          className={`${base} ${mode === 'new' ? 'border-blue-600 bg-blue-50' : 'border-slate-200 bg-white hover:border-blue-300'}`}
+        >
+          <div className={`p-2.5 rounded-xl ${mode === 'new' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}>
+            <PlusCircle size={22} />
+          </div>
+          <div>
+            <p className="font-bold text-slate-800">Entrada nuevo material</p>
+            <p className="text-xs text-slate-500 mt-1">Da de alta un material que todavía no existe.</p>
+          </div>
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const normalizeText = (value: string) =>
+  value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+const RestockForm: React.FC<{
+  items: StockItem[];
+  onRestock: AddItemProps['onRestock'];
+  onDone: () => void;
+  onCancel: () => void;
+}> = ({ items, onRestock, onDone, onCancel }) => {
+  const [search, setSearch] = useState('');
+  const [open, setOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [amount, setAmount] = useState('1');
+  const [obra, setObra] = useState('');
+  const [note, setNote] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const sorted = useMemo(
+    () => [...items].sort((a, b) => a.concept.localeCompare(b.concept, 'es', { sensitivity: 'base' })),
+    [items]
+  );
+
+  const filtered = useMemo(() => {
+    const q = normalizeText(search.trim());
+    if (!q) return sorted;
+    return sorted.filter(item =>
+      normalizeText(`${item.concept} ${item.obra} ${item.description} ${item.location ?? ''}`).includes(q)
+    );
+  }, [sorted, search]);
+
+  const selected = items.find(i => i.id === selectedId) ?? null;
+
+  const selectItem = (item: StockItem) => {
+    setSelectedId(item.id);
+    setObra(item.obra);
+    setSearch('');
+    setOpen(false);
+    setError(null);
+  };
+
+  const parsedAmount = Math.floor(Number(amount));
+  const canSave = !!selected && Number.isFinite(parsedAmount) && parsedAmount >= 1 && !saving;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selected || !canSave) return;
+    setSaving(true);
+    setError(null);
+    const ok = await onRestock(selected.id, parsedAmount, obra, note);
+    setSaving(false);
+    if (ok) onDone();
+    else setError('No se pudo guardar la entrada. Inténtalo de nuevo.');
+  };
+
+  return (
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm">
+      <div className="p-8">
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">Actualizar material existente</h2>
+        <p className="text-slate-500 mb-8 text-sm">Busca el material, elige cuántas unidades entran y guarda.</p>
+
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="space-y-2" ref={boxRef}>
+            <label className="text-sm font-semibold text-slate-700">Material</label>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setOpen(o => !o)}
+                className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 flex items-center justify-between text-left"
+              >
+                {selected ? (
+                  <span className="truncate">
+                    <span className="font-semibold text-slate-800">{selected.concept}</span>
+                    <span className="text-slate-400 text-sm"> · {selected.obra} · {selected.quantity} uds.</span>
+                  </span>
+                ) : (
+                  <span className="text-slate-400">Selecciona un material...</span>
+                )}
+                <ChevronDown size={18} className={`text-slate-400 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+              </button>
+
+              {open && (
+                <div className="absolute z-20 mt-2 w-full bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden">
+                  <div className="p-2 border-b border-slate-100 relative">
+                    <Search size={16} className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      autoFocus
+                      value={search}
+                      onChange={e => setSearch(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          if (filtered.length > 0) selectItem(filtered[0]);
+                        }
+                        if (e.key === 'Escape') setOpen(false);
+                      }}
+                      placeholder="Buscar por nombre, obra, descripción o ubicación..."
+                      className="w-full pl-9 pr-3 py-2.5 bg-slate-50 rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    />
+                  </div>
+                  <ul className="max-h-72 overflow-y-auto">
+                    {filtered.length === 0 && (
+                      <li className="px-4 py-6 text-center text-sm text-slate-400">
+                        {items.length === 0 ? 'No hay materiales en el inventario.' : 'Ningún material coincide con la búsqueda.'}
+                      </li>
+                    )}
+                    {filtered.map(item => (
+                      <li key={item.id}>
+                        <button
+                          type="button"
+                          onClick={() => selectItem(item)}
+                          className={`w-full text-left px-4 py-3 hover:bg-blue-50 flex items-center gap-3 ${item.id === selectedId ? 'bg-blue-50' : ''}`}
+                        >
+                          {item.imageUrl ? (
+                            <img src={item.imageUrl} alt="" className="w-10 h-10 rounded-lg object-cover shrink-0" />
+                          ) : (
+                            <div className="w-10 h-10 rounded-lg bg-slate-100 flex items-center justify-center shrink-0">
+                              <Package size={18} className="text-slate-400" />
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <p className="font-semibold text-slate-800 truncate">{item.concept}</p>
+                            <p className="text-xs text-slate-500 truncate">
+                              {item.obra}{item.location ? ` · ${item.location}` : ''}
+                            </p>
+                          </div>
+                          <span className="text-sm font-bold text-slate-700 shrink-0">{item.quantity} uds.</span>
+                          {item.id === selectedId && <Check size={16} className="text-blue-600 shrink-0" />}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="px-4 py-2 text-[11px] text-slate-400 border-t border-slate-100">
+                    {filtered.length} de {items.length} materiales
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {selected && (
+            <>
+              <div className="rounded-xl bg-slate-50 border border-slate-200 p-4 text-sm text-slate-600 space-y-1">
+                <p><span className="font-semibold text-slate-700">Descripción:</span> {selected.description}</p>
+                {selected.location && <p><span className="font-semibold text-slate-700">Ubicación:</span> {selected.location}</p>}
+                <p>
+                  <span className="font-semibold text-slate-700">Stock actual:</span> {selected.quantity} uds.
+                  {Number.isFinite(parsedAmount) && parsedAmount >= 1 && (
+                    <span className="text-emerald-700 font-semibold"> → {selected.quantity + parsedAmount} uds.</span>
+                  )}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-slate-700 flex items-center gap-1">
+                    <Package size={14} className="text-blue-600" /> Unidades que entran
+                  </label>
+                  <input
+                    required
+                    type="number"
+                    min={1}
+                    inputMode="numeric"
+                    value={amount}
+                    onChange={e => setAmount(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-slate-700 flex items-center gap-1">
+                    <MapPin size={14} className="text-blue-600" /> Obra de procedencia
+                  </label>
+                  <input
+                    type="text"
+                    value={obra}
+                    onChange={e => setObra(e.target.value)}
+                    placeholder="Ej. C.C. La Maquinista"
+                    className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-slate-700">Nota (opcional)</label>
+                <input
+                  type="text"
+                  value={note}
+                  onChange={e => setNote(e.target.value)}
+                  placeholder="Ej. Albarán 1234"
+                  className="w-full px-4 py-3 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            </>
+          )}
+
+          {error && <p className="text-sm text-rose-600 font-medium">{error}</p>}
+
+          <div className="pt-2 flex gap-4">
+            <button
+              type="button"
+              onClick={onCancel}
+              className="flex-1 px-6 py-4 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-colors flex items-center justify-center gap-2"
+            >
+              <X size={20} /> Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={!canSave}
+              className="flex-[2] px-6 py-4 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 shadow-lg shadow-blue-500/20 transition-all flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 disabled:active:scale-100"
+            >
+              <Save size={20} /> {saving ? 'Guardando...' : 'Actualizar stock'}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );

@@ -5,6 +5,7 @@ export interface User {
   id: string;
   name: string;
   role: UserRole;
+  email?: string;
   avatar?: string;   // <- antes era: avatar: string;
 }
 
@@ -15,11 +16,23 @@ export interface StockItem {
   description: string;
   obra: string; // Obra de procedencia
   quantity: number;
+  isRecurrent: boolean;
+  minStock?: number;
   location?: string; // Ubicación dentro del almacén
   imageUrl: string;
   createdAt: number;
   updatedAt: number;
 }
+
+// Usuarios que siempre pueden editar las unidades del inventario,
+// independientemente del rol guardado en Supabase.
+export const UNIT_EDITOR_EMAILS = ['jrserna@ignaser.es'];
+
+export const canEditUnits = (user: User | null | undefined): boolean => {
+  if (!user) return false;
+  if (user.role === 'Admin' || user.role === 'Operario') return true;
+  return !!user.email && UNIT_EDITOR_EMAILS.includes(user.email.toLowerCase());
+};
 
 export type MovementType = 'IN' | 'OUT' | 'ADJUST' | 'CREATE' | 'REMOVE';
 
